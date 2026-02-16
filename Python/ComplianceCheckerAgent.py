@@ -25,6 +25,7 @@ Usage:
 import os
 import re
 import json
+import shutil
 import argparse
 from typing import TypedDict, List, Dict, Optional, Annotated
 from pathlib import Path
@@ -126,15 +127,17 @@ def load_company_sections(folder_path: Path) -> Dict[str, str]:
 def discover_companies(reports_dir: Path) -> List[Dict]:
     """
     Discover all company section folders under Extracted_Reports/.
-    Looks for folders ending in '_sections' or any folder containing .md files.
+    Skips COMPLETED folder. Any subfolder containing .md files is a company.
     """
     companies = []
     for item in sorted(reports_dir.iterdir()):
         if not item.is_dir():
             continue
+        # Skip COMPLETED and any hidden folders
+        if item.name.upper() == "COMPLETED" or item.name.startswith("."):
+            continue
         md_files = list(item.glob("*.md"))
         if md_files:
-            # Derive company name from folder name
             name = item.name
             if name.endswith("_sections"):
                 name = name[: -len("_sections")]
@@ -726,15 +729,20 @@ def write_matrix(rows: List[Dict], path: str):
 
 def run(reports_dir: str, rules_path: str, output_path: str, rules_sheet: str = "AS to Validate"):
     reports_root = Path(reports_dir)
+    completed_dir = reports_root / "COMPLETED"
+    completed_dir.mkdir(parents=True, exist_ok=True)
+
     companies = discover_companies(reports_root)
 
     if not companies:
         print(f"No company folders found in {reports_root}")
+        print(f"  (Skipping 'COMPLETED' folder)")
+        print(f"  Expected: subfolders containing .md section files")
         return
 
     print(f"Found {len(companies)} company folder(s):")
     for c in companies:
-        print(f"  • {c['name']} ({c['section_count']} sections)")
+        print(f"  • {c['name']} ({c['section_count']} sections) → {c['folder'].name}/")
 
     rules = parse_rules(rules_path, rules_sheet)
     print(f"\nLoaded {len(rules)} rule(s) from '{rules_path}'")
@@ -783,6 +791,13 @@ def run(reports_dir: str, rules_path: str, output_path: str, rules_sheet: str = 
             final = workflow.invoke(initial)
             all_rows.append(state_to_row(final))
 
+        # ── Move completed company folder to COMPLETED ──
+        dest = completed_dir / company["folder"].name
+        if dest.exists():
+            shutil.rmtree(dest)  # overwrite if re-running
+        shutil.move(str(company["folder"]), str(dest))
+        print(f"\n  📁 Moved → COMPLETED/{company['folder'].name}")
+
     write_matrix(all_rows, output_path)
 
     debug = Path(output_path).with_suffix(".debug.json")
@@ -796,14 +811,74 @@ def run(reports_dir: str, rules_path: str, output_path: str, rules_sheet: str = 
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 11. CLI
+# 11. CLI — Smart defaults, no required arguments
 # ═══════════════════════════════════════════════════════════════════
 
+def _auto_detect_paths() -> Dict[str, str]:
+    """
+    Auto-detect project paths relative to this script's location.
+    Expected structure:
+      project_root/
+        Python/
+          audit_orchestration.py   ← this script
+        Extracted_Reports/
+          CompanyA_sections/
+          COMPLETED/
+        Accounting Standard - Rules.xlsx
+        Compliance Matrix.xlsx
+    """
+    script_dir = Path(__file__).resolve().parent        # Python/
+    project_root = script_dir.parent                     # project_root/
+
+    # Try multiple common locations for each path
+    reports_candidates = [
+        project_root / "Extracted_Reports",
+        script_dir / "Extracted_Reports",
+        Path("Extracted_Reports"),
+    ]
+    rules_candidates = [
+        project_root / "Accounting Standard - Rules.xlsx",
+        script_dir / "Accounting Standard - Rules.xlsx",
+        Path("Accounting Standard - Rules.xlsx"),
+    ]
+
+    reports = next((p for p in reports_candidates if p.exists()), reports_candidates[0])
+    rules = next((p for p in rules_candidates if p.exists()), rules_candidates[0])
+    output = project_root / "Compliance Matrix.xlsx"
+
+    return {
+        "reports": str(reports),
+        "rules": str(rules),
+        "output": str(output),
+    }
+
+
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="NFRA Audit Compliance — LangGraph Orchestration")
-    p.add_argument("--reports", required=True, help="Path to Extracted_Reports folder")
-    p.add_argument("--rules", required=True, help="Path to Accounting Standard Rules Excel")
-    p.add_argument("--output", default="Compliance Matrix.xlsx", help="Output Excel path")
-    p.add_argument("--sheet", default="AS to Validate", help="Rules sheet name in Excel")
+    defaults = _auto_detect_paths()
+
+    p = argparse.ArgumentParser(
+        description="NFRA Audit Compliance — LangGraph Orchestration",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "If no arguments are provided, paths are auto-detected from the project structure.\n"
+            f"  --reports  → {defaults['reports']}\n"
+            f"  --rules    → {defaults['rules']}\n"
+            f"  --output   → {defaults['output']}"
+        ),
+    )
+    p.add_argument("--reports", default=defaults["reports"], help="Extracted_Reports folder")
+    p.add_argument("--rules", default=defaults["rules"], help="Accounting Standard Rules Excel")
+    p.add_argument("--output", default=defaults["output"], help="Output Compliance Matrix Excel")
+    p.add_argument("--sheet", default="AS to Validate", help="Sheet name in rules Excel")
     args = p.parse_args()
+
+    print(f"{'═' * 70}")
+    print(f"NFRA Audit Compliance — LangGraph Orchestration Engine")
+    print(f"{'═' * 70}")
+    print(f"  Reports:  {args.reports}")
+    print(f"  Rules:    {args.rules}")
+    print(f"  Output:   {args.output}")
+    print(f"  Sheet:    {args.sheet}")
+    print(f"{'═' * 70}\n")
+
     run(args.reports, args.rules, args.output, args.sheet)
