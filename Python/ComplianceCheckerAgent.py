@@ -80,20 +80,24 @@ class AuditState(TypedDict):
     standard_ref: str
     audit_requirement: str
 
-    # ── Questions parsed from rules Excel ──
-    # Each: {"question": str, "target_sections": [str], "financial_check": dict|None}
-    parsed_questions: List[Dict]
-    current_question_index: int
+    # ── Workflow steps parsed from rules Excel ──
+    # OrderedDict keyed by step ID: {"1": {step_id, question, target_sections, ...}, "2.1": {...}, ...}
+    workflow_steps: Dict[str, Dict]
+    step_order: List[str]          # ["1", "2.1", "2.2", "2.3", "3", "4", "4.1", "5", "6"]
+    current_step_id: str           # e.g. "1", "2.2", "3" — NOT an integer index
+    steps_executed: int            # safety counter to prevent infinite loops
+    skipped_steps: List[str]       # step IDs that were skipped by conditional routing
 
     # ── Report content (loaded from section .md files) ──
-    available_sections: Dict[str, str]   # {"Balance Sheet": "md content", ...}
-    section_filenames: Dict[str, str]    # {"Balance Sheet": "Balance Sheet.md", ...}
+    available_sections: Dict[str, str]
+    section_filenames: Dict[str, str]
 
     # ── Accumulated results ──
     question_responses: List[Dict]
 
     # ── Failure logic ──
     failure_trigger_text: str
+    raw_workflow: str
     failure_trigger_met: bool
 
     # ── Final output (→ Compliance Matrix columns) ──
@@ -223,7 +227,7 @@ def match_section(target: str, available: Dict[str, str]) -> List[str]:
     return best
 
 
-def retrieve_sections(available: Dict[str, str], targets: List[str], max_chars: int = 10000) -> tuple:
+def retrieve_sections(available: Dict[str, str], targets: List[str], max_chars: int = 30000) -> tuple:
     """
     Fetch content for the requested target sections.
     Includes clear headers and truncation for token management.
@@ -257,12 +261,48 @@ def retrieve_sections(available: Dict[str, str], targets: List[str], max_chars: 
 # 5. RULES PARSER — reads audit rules from Excel
 # ═══════════════════════════════════════════════════════════════════
 
-def parse_question_line(line: str) -> Dict:
-    """Parse '1. Question text? : [Section1], [Section2],' → structured dict."""
-    cleaned = re.sub(r"^\d+\.\s*", "", line.strip())
-    targets = re.findall(r"\[([^\]]+)\]", cleaned)
-    question = re.sub(r"\s*:?\s*\[.*", "", cleaned).rstrip(",").strip()
-    return {"question": question, "target_sections": targets, "financial_check": None}
+def parse_question_line(block: str) -> Dict:
+    """
+    Parse workflow step blocks:
+      '1. Does the Clause 9...' → step_id="1"
+      '2.1 If yes, ...'         → step_id="2.1"
+      '4. Has the Company...'   → step_id="4"
+
+    Handles: "N.", "N.N", "N.N " patterns at the start.
+    """
+    block = block.strip()
+
+    # Try matching "2.1 If yes..." (sub-step with digit after dot)
+    m = re.match(r"^(\d+\.\d+)\s+(.*)", block, re.DOTALL)
+    if not m:
+        # Try matching "1. Does the..." (main step with dot-space separator)
+        m = re.match(r"^(\d+)\.\s+(.*)", block, re.DOTALL)
+    if not m:
+        # Try matching "5 If from..." (step without dot)
+        m = re.match(r"^(\d+)\s+(.*)", block, re.DOTALL)
+    if not m:
+        return None
+
+    step_id = m.group(1)
+    rest = m.group(2).strip()
+
+    targets_raw = re.findall(r"\[([^\]]+)\]", rest)
+    # Handle comma-separated sections within a single bracket: [P&L, Balance Sheet]
+    targets = []
+    for t in targets_raw:
+        if "," in t:
+            targets.extend([s.strip() for s in t.split(",") if s.strip()])
+        else:
+            targets.append(t.strip())
+    question = re.sub(r"\s*:?\s*\[.*", "", rest).rstrip(",").strip()
+
+    return {
+        "step_id": step_id,
+        "question": question,
+        "target_sections": targets,
+        "financial_check": None,
+        "raw_text": block,
+    }
 
 
 def parse_financial_check(text: str) -> Dict | None:
@@ -281,7 +321,7 @@ def parse_financial_check(text: str) -> Dict | None:
 
 
 def parse_rules(excel_path: str, sheet: str = "AS to Validate") -> List[Dict]:
-    """Read rules Excel → list of structured rule dicts."""
+    """Read rules Excel → list of structured rule dicts with ordered workflow steps."""
     df = pd.read_excel(excel_path, sheet_name=sheet)
     df.columns = [str(c).strip() for c in df.columns]
     rules = []
@@ -294,34 +334,71 @@ def parse_rules(excel_path: str, sheet: str = "AS to Validate") -> List[Dict]:
         raw_qs = str(row.get("Audit Questions : Target Sections", ""))
         trigger = str(row.get("Failure Trigger", ""))
 
-        blocks = re.split(r"(?=\d+\.\s)", raw_qs)
-        blocks = [b.strip() for b in blocks if b.strip()]
+        # ── STEP 1: Split raw text into lines ──
+        # Excel cells use \n or \r\n for line breaks
+        lines = raw_qs.replace("\r\n", "\n").split("\n")
 
-        parsed_qs = []
+        # ── STEP 2: Merge lines into blocks ──
+        # A new block starts when a line begins with a step number like "1.", "2.1", "3."
+        # Matches: "1. Does...", "2.1 If...", "3. Check...", "4.1 If..."
+        STEP_PATTERN = re.compile(r"^\d+(?:\.\d+)?\s|^\d+\.\s")
+
+        blocks = []
+        current_block = ""
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            if STEP_PATTERN.match(line):
+                if current_block:
+                    blocks.append(current_block)
+                current_block = line
+            elif line.lower().startswith("the financial check"):
+                if current_block:
+                    blocks.append(current_block)
+                current_block = line
+            else:
+                # Continuation of previous block
+                current_block += " " + line
+        if current_block:
+            blocks.append(current_block)
+
+        # ── STEP 3: Parse each block ──
+        workflow_steps = OrderedDict()
         fin_check = None
+
         for block in blocks:
+            block = block.strip()
+            if not block:
+                continue
             if block.lower().startswith("the financial check"):
                 fin_check = parse_financial_check(block)
-            else:
-                pq = parse_question_line(block)
-                if pq["question"]:
-                    parsed_qs.append(pq)
+                continue
 
-        # Attach financial check to the relevant question
-        if fin_check and parsed_qs:
-            for pq in reversed(parsed_qs):
-                if "financial check" in pq["question"].lower() or "%" in pq["question"]:
-                    pq["financial_check"] = fin_check
-                    pq["target_sections"] = list(set(pq["target_sections"] + fin_check["all_sections"]))
+            parsed = parse_question_line(block)
+            if parsed and parsed["question"]:
+                workflow_steps[parsed["step_id"]] = parsed
+
+        # Attach financial check to the relevant step
+        if fin_check:
+            for sid in reversed(list(workflow_steps.keys())):
+                step = workflow_steps[sid]
+                if "financial check" in step["question"].lower() or "%" in step["question"]:
+                    step["financial_check"] = fin_check
+                    step["target_sections"] = list(set(step["target_sections"] + fin_check["all_sections"]))
                     break
+
+        step_order = list(workflow_steps.keys())
 
         rules.append({
             "rule_id": rule_id,
             "rule_details": str(row.get("Rule Details", "")).strip(),
             "standard_ref": str(row.get("Standard Ref", "")).strip(),
             "audit_requirement": str(row.get("Audit Requirement", "")).strip(),
-            "parsed_questions": parsed_qs,
+            "workflow_steps": workflow_steps,
+            "step_order": step_order,
             "failure_trigger_text": trigger,
+            "raw_workflow": raw_qs,
         })
 
     return rules
@@ -351,7 +428,9 @@ def llm_json(prompt: str, fallback: Dict) -> Dict:
 # ─── NODE 1: Initialize ──────────────────────────────────────────
 
 def node_init(state: AuditState) -> AuditState:
-    state["current_question_index"] = 0
+    state["current_step_id"] = state["step_order"][0] if state["step_order"] else "DONE"
+    state["steps_executed"] = 0
+    state["skipped_steps"] = []
     state["question_responses"] = []
     state["failure_trigger_met"] = False
     state["compliance_status"] = None
@@ -365,39 +444,39 @@ def node_init(state: AuditState) -> AuditState:
 
 def node_process_question(state: AuditState) -> AuditState:
     """
-    Core reasoning node. For the current question:
-      1. Retrieves the right section(s) from the report
-      2. Builds context from all prior Q&A (enables cross-section reasoning)
-      3. Sends to LLM for analysis
+    Core reasoning node. Executes the CURRENT STEP of the audit workflow.
+    Uses step_id to look up the step, retrieves sections, includes prior context.
     """
-    idx = state["current_question_index"]
-    q = state["parsed_questions"][idx]
-    total = len(state["parsed_questions"])
+    sid = state["current_step_id"]
+    step = state["workflow_steps"][sid]
+    total = len(state["step_order"])
+    executed = state["steps_executed"] + 1
+    state["steps_executed"] = executed
 
-    print(f"    Q{idx+1}/{total}: {q['question'][:90]}...")
+    print(f"    Step {sid} ({executed}/{total}): {step['question'][:80]}...")
 
     # ── Retrieve target sections ──
     section_content, matched, unmatched = retrieve_sections(
-        state["available_sections"], q["target_sections"]
+        state["available_sections"], step["target_sections"]
     )
 
-    # ── Cumulative context from prior questions (cross-section reasoning) ──
+    # ── Cumulative context from prior steps ──
     prior_context = ""
     if state["question_responses"]:
-        prior_context = "\n\n─── PRIOR FINDINGS (from earlier steps in this audit) ───\n"
-        for i, r in enumerate(state["question_responses"]):
+        prior_context = "\n\n─── PRIOR FINDINGS ───\n"
+        for r in state["question_responses"]:
             prior_context += (
-                f"\nStep {i+1}: {r['question']}\n"
+                f"\nStep {r['step_id']}: {r['question']}\n"
                 f"  Answer: {r['answer']}\n"
-                f"  Key Evidence: {r['evidence'][:300]}\n"
+                f"  Evidence: {r['evidence'][:300]}\n"
             )
 
-    # ── Financial check instructions (if applicable) ──
+    # ── Financial check instructions ──
     fin_block = ""
-    if q.get("financial_check"):
-        fc = q["financial_check"]
+    if step.get("financial_check"):
+        fc = step["financial_check"]
         fin_block = f"""
-═══ THIS QUESTION REQUIRES A FINANCIAL CALCULATION ═══
+═══ THIS STEP REQUIRES A FINANCIAL CALCULATION ═══
 Numerator: {fc['numerator_desc']}
 Denominator: {fc['denominator_desc']}
 
@@ -408,55 +487,120 @@ Procedure:
   4. Ratio = (Finance Cost / Average Borrowings) × 100
   5. If ratio < 6%, answer YES (suspiciously low)
   6. Show all numbers and the calculation in your reasoning
-═══════════════════════════════════════════════════════
+═══════════════════════════════════════════════════
 """
 
-    # ── Prompt ──
-    prompt = f"""You are an expert Indian financial auditor analyzing a company's annual report
-for compliance with accounting standards and regulatory requirements.
+    # ── Build full workflow map for context ──
+    workflow_map = ""
+    skipped = state.get("skipped_steps", [])
+    for s_id in state["step_order"]:
+        s = state["workflow_steps"][s_id]
+        if s_id == sid:
+            marker = "→ CURRENT"
+        elif any(r["step_id"] == s_id for r in state["question_responses"]):
+            marker = "  ✓ done"
+        elif s_id in skipped:
+            marker = "  ✗ skipped"
+        else:
+            marker = ""
+        workflow_map += f"  [{s_id}] {s['question'][:80]}  {marker}\n"
+
+    # ── Extract search keywords from the question ──
+    # Guide the LLM to look for specific terms in large documents
+    question_lower = step["question"].lower()
+    keyword_hints = set()
+    # Add terms directly from the question
+    for term in ["npa", "non-performing", "non performing", "default", "interest",
+                 "borrowing", "loan", "repayment", "accounted", "not accounted",
+                 "provision", "accrual", "derecogn", "impair", "classified",
+                 "caro", "clause 9", "clause ix", "finance cost", "amortized",
+                 "effective interest", "section 186"]:
+        if term in question_lower:
+            keyword_hints.add(term)
+    # Always add terms from the rule context
+    rule_lower = state["rule_details"].lower()
+    for term in ["npa", "non-performing", "interest", "default", "loan"]:
+        if term in rule_lower:
+            keyword_hints.add(term)
+
+    keyword_block = ""
+    if keyword_hints:
+        keyword_block = f"""
+SEARCH GUIDANCE — Look for these keywords/phrases in the report content:
+  {', '.join(sorted(keyword_hints))}
+  Also search for synonyms and related terms (e.g., "NPA" = "Non-Performing Asset",
+  "default" = "overdue", "classified as NPA", "not charged interest", etc.)
+  Scan the ENTIRE section — relevant information may be buried in the middle of the document,
+  not just in headers or the first few paragraphs.
+"""
+
+    prompt = f"""You are an expert Indian financial auditor executing a structured audit workflow.
+You must follow the workflow EXACTLY — including conditional branches (if yes → ..., if no → ...).
 
 COMPANY: {state['company_name']}
 RULE: {state['rule_id']} — {state['rule_details']}
 STANDARD: {state['standard_ref']}
 REQUIREMENT: {state['audit_requirement']}
 
-──────────────────────────────────────────────────────
-CURRENT QUESTION ({idx+1} of {total}):
-{q['question']}
-──────────────────────────────────────────────────────
+══════════════════════════════════════════════
+FULL WORKFLOW MAP (you are at step {sid}):
+══════════════════════════════════════════════
+{workflow_map}
+
+FAILURE TRIGGER:
+{state['failure_trigger_text']}
 {prior_context}
+══════════════════════════════════════════════
+CURRENT STEP [{sid}]:
+{step['raw_text']}
+══════════════════════════════════════════════
 {fin_block}
-──────────────────────────────────────────────────────
-REPORT CONTENT (from sections: {matched}):
+{keyword_block}
+REPORT CONTENT (sections: {matched}):
 {section_content}
-──────────────────────────────────────────────────────
+══════════════════════════════════════════════
 
 INSTRUCTIONS:
-- Answer based ONLY on what the report content states or clearly omits
-- If information is not found, state "Not found in the provided sections"
-- Provide EXACT evidence — quote relevant text, table rows, or figures
-- Build on prior findings when the current question depends on earlier answers
-- Be precise about which section and what part of it you are referencing
+1. Execute ONLY step [{sid}]. Do not jump ahead.
+2. If this step is conditional (e.g., "If yes...", "If no, go to..."):
+   - Check PRIOR FINDINGS to determine which branch applies
+   - Apply the condition based on actual evidence found in prior steps
+3. SEARCH THOROUGHLY:
+   - Read the ENTIRE section content from start to end, not just the beginning
+   - Look for the keywords listed above and any related terms
+   - Information may appear in notes, sub-notes, disclosure paragraphs, or table footnotes
+   - If the section is long, scan for the specific keywords before concluding "Not Found"
+4. EVIDENCE DISCIPLINE:
+   - Quote EXACT text from the report — copy the relevant sentence(s) verbatim
+   - Name the specific section and context (e.g., "Note 12 - Borrowings" or "Para 3 of CARO")
+   - "Not Found" means you searched thoroughly and the information genuinely does not exist
 
-Respond ONLY with valid JSON (no markdown fences, no extra text):
+CONFIDENCE RUBRIC (apply strictly):
+  95-100: Direct explicit statement found
+  80-94:  Strong evidence, minor interpretation needed
+  60-79:  Indirect/partial evidence
+  40-59:  Weak evidence, significant uncertainty
+  20-39:  Very little relevant info
+  0-19:   Nothing relevant found
+  DO NOT default to any fixed number.
+
+Respond ONLY with valid JSON:
 {{
     "answer": "Yes / No / Not Found / descriptive answer",
-    "evidence": "Exact quote or data from the report supporting your answer",
-    "section_ref": "Name of section where evidence was found",
-    "reasoning": "Step-by-step explanation of your analysis",
-    "confidence": 85
+    "evidence": "EXACT quote from report (copy verbatim, or 'None found')",
+    "section_ref": "Section name where evidence was found",
+    "reasoning": "Step-by-step explanation referencing workflow logic and prior findings",
+    "confidence": <integer 0-100>
 }}"""
 
     result = llm_json(prompt, {
         "answer": "Error — unable to process",
-        "evidence": "",
-        "section_ref": "",
-        "reasoning": "LLM invocation failed",
-        "confidence": 0,
+        "evidence": "", "section_ref": "", "reasoning": "LLM failed", "confidence": 0,
     })
 
-    result["question"] = q["question"]
-    result["target_sections"] = q["target_sections"]
+    result["step_id"] = sid
+    result["question"] = step["question"]
+    result["target_sections"] = step["target_sections"]
     result["matched_sections"] = matched
     result["unmatched_sections"] = unmatched
     state["question_responses"].append(result)
@@ -468,42 +612,123 @@ Respond ONLY with valid JSON (no markdown fences, no extra text):
 # ─── NODE 3: Validate ────────────────────────────────────────────
 
 def node_validate(state: AuditState) -> AuditState:
-    """Senior auditor review — checks evidence quality and reasoning logic."""
-    idx = state["current_question_index"]
-    r = state["question_responses"][idx]
+    """Senior auditor review — checks evidence quality and recalibrates confidence."""
+    r = state["question_responses"][-1]  # always the last response
 
-    prompt = f"""You are a SENIOR AUDITOR reviewing a junior analyst's work on an Indian company audit.
+    prompt = f"""You are a SENIOR AUDITOR reviewing a junior analyst's work. Be critical and honest.
 
-Question: {r['question']}
-Answer given: {r['answer']}
-Evidence cited: {r['evidence']}
+Step [{r['step_id']}]: {r['question']}
+Answer: {r['answer']}
+Evidence: {r['evidence']}
 Reasoning: {r['reasoning']}
 Confidence claimed: {r.get('confidence', 'N/A')}
 
-Evaluate:
-1. Is the evidence specific, verifiable, and directly relevant?
-2. Does the reasoning logically support the conclusion?
-3. Are there gaps or overlooked considerations?
-4. Is the confidence score justified given the evidence strength?
+EVALUATE RIGOROUSLY:
+1. Is the evidence an exact quote or vague? Exact → strong. Vague → LOWER confidence.
+2. Does the reasoning logically hold?
+3. "Not found" with high confidence is wrong unless absence IS the finding.
+
+CONFIDENCE RECALIBRATION:
+  95-100: Exact quote directly answering the question
+  80-94:  Good evidence, minor interpretation
+  60-79:  Partial evidence, inference needed
+  40-59:  Weak evidence
+  20-39:  Barely any info
+  0-19:   Nothing found
 
 Respond ONLY with valid JSON:
 {{
-    "is_valid": true,
-    "issues": "Any problems (or 'None')",
-    "adjusted_confidence": {r.get('confidence', 70)}
+    "is_valid": true or false,
+    "issues": "Specific problems (or 'None')",
+    "adjusted_confidence": <integer 0-100>
 }}"""
 
-    v = llm_json(prompt, {"is_valid": True, "issues": "Validation skipped", "adjusted_confidence": r.get("confidence", 60)})
-    state["question_responses"][idx]["validation"] = v
-    if v.get("adjusted_confidence"):
-        state["question_responses"][idx]["confidence"] = v["adjusted_confidence"]
+    v = llm_json(prompt, {"is_valid": True, "issues": "Validation skipped", "adjusted_confidence": r.get("confidence", 50)})
+    state["question_responses"][-1]["validation"] = v
+    if v.get("adjusted_confidence") is not None:
+        state["question_responses"][-1]["confidence"] = v["adjusted_confidence"]
     return state
 
 
-# ─── NODE 4: Increment ───────────────────────────────────────────
+# ─── NODE 4: Route Next Step (LLM-powered workflow router) ───────
 
-def node_increment(state: AuditState) -> AuditState:
-    state["current_question_index"] += 1
+def node_route_next_step(state: AuditState) -> AuditState:
+    """
+    LLM-powered workflow router. Determines next step based on:
+      - Conditional logic in the workflow text
+      - The last step's answer
+      - Which steps are done/skipped
+    When jumping (e.g., 1→3), marks intermediate steps as SKIPPED permanently.
+    """
+    last = state["question_responses"][-1]
+    current_sid = state["current_step_id"]
+    executed_ids = [r["step_id"] for r in state["question_responses"]]
+    skipped = state.get("skipped_steps", [])
+
+    # Build status display — DONE / SKIPPED / PENDING
+    step_status = ""
+    for sid in state["step_order"]:
+        s = state["workflow_steps"][sid]
+        if sid in executed_ids:
+            ans = next((r["answer"] for r in state["question_responses"] if r["step_id"] == sid), "?")
+            step_status += f"  [{sid}] ✓ DONE — Answer: {ans[:60]}\n"
+        elif sid in skipped:
+            step_status += f"  [{sid}] ✗ SKIPPED (conditional branch not taken)\n"
+        else:
+            step_status += f"  [{sid}] ○ PENDING — {s['question'][:60]}\n"
+
+    remaining = [s for s in state["step_order"] if s not in executed_ids and s not in skipped]
+
+    prompt = f"""You are a workflow controller. Your ONLY job is to pick the NEXT step ID.
+
+WORKFLOW STATUS:
+{step_status}
+
+LAST EXECUTED: Step [{current_sid}]
+LAST ANSWER: {last['answer']}
+
+REMAINING STEPS (pick from these ONLY): {remaining}
+
+ROUTING RULES:
+1. Read the original workflow text below for conditional logic.
+2. "If no, go to point 3" means SKIP to step "3" (intermediate steps are not executed).
+3. "If yes, ..." means continue to the next sub-step in order.
+4. No conditional → pick the next step in the remaining list.
+5. NEVER pick a DONE or SKIPPED step.
+6. If no remaining steps, return "DONE".
+
+ORIGINAL WORKFLOW:
+{state['raw_workflow']}
+
+Respond ONLY with valid JSON:
+{{
+    "next_step_id": "<step ID from remaining list, or 'DONE'>",
+    "routing_reason": "Brief explanation"
+}}"""
+
+    result = llm_json(prompt, {"next_step_id": "DONE", "routing_reason": "Routing failed"})
+    next_id = result.get("next_step_id", "DONE").strip()
+
+    # Validate: must be in remaining or DONE
+    if next_id != "DONE" and next_id not in remaining:
+        # Fallback: pick first remaining
+        next_id = remaining[0] if remaining else "DONE"
+
+    # ── Mark intermediate steps as SKIPPED ──
+    if next_id != "DONE":
+        current_pos = state["step_order"].index(current_sid) if current_sid in state["step_order"] else -1
+        next_pos = state["step_order"].index(next_id) if next_id in state["step_order"] else -1
+        if next_pos > current_pos + 1:
+            for i in range(current_pos + 1, next_pos):
+                skip_id = state["step_order"][i]
+                if skip_id not in executed_ids and skip_id not in skipped:
+                    skipped.append(skip_id)
+                    print(f"      ✗ Skipping step [{skip_id}] (conditional branch not taken)")
+    state["skipped_steps"] = skipped
+
+    state["current_step_id"] = next_id
+    reason = result.get("routing_reason", "")
+    print(f"      ↳ Router: [{current_sid}] → [{next_id}]  ({reason[:60]})")
     return state
 
 
@@ -517,47 +742,65 @@ def node_evaluate_triggers(state: AuditState) -> AuditState:
     print(f"  ⚖ Evaluating failure triggers...")
 
     qa_block = ""
-    for i, r in enumerate(state["question_responses"]):
-        qa_block += (
-            f"Q{i+1}: {r['question']}\n"
-            f"Answer: {r['answer']}\n"
-            f"Evidence: {r['evidence']}\n"
-            f"Section: {r.get('section_ref', 'N/A')}\n"
-            f"Confidence: {r.get('confidence', 'N/A')}\n\n"
-        )
+    executed_ids = [r["step_id"] for r in state["question_responses"]]
+    skipped = state.get("skipped_steps", [])
+    for sid in state["step_order"]:
+        if sid in skipped:
+            qa_block += f"Step [{sid}]: SKIPPED (conditional branch not taken)\n\n"
+        elif sid in executed_ids:
+            r = next(r for r in state["question_responses"] if r["step_id"] == sid)
+            qa_block += (
+                f"Step [{sid}]: {r['question']}\n"
+                f"Answer: {r['answer']}\n"
+                f"Evidence: {r['evidence']}\n"
+                f"Section: {r.get('section_ref', 'N/A')}\n"
+                f"Confidence: {r.get('confidence', 'N/A')}\n\n"
+            )
 
     prompt = f"""You are a senior auditor making the FINAL compliance determination for an Indian company.
+You have followed a structured audit workflow step by step. Now synthesize all findings.
 
 COMPANY: {state['company_name']}
 RULE: {state['rule_id']} — {state['rule_details']}
 STANDARD: {state['standard_ref']}
+REQUIREMENT: {state['audit_requirement']}
 
 ══════════════════════════════════════════════
-COMPLETE AUDIT TRAIL:
+AUDIT WORKFLOW THAT WAS FOLLOWED:
+══════════════════════════════════════════════
+{state.get('raw_workflow', 'N/A')}
+
+══════════════════════════════════════════════
+COMPLETE AUDIT TRAIL (results from each workflow step):
 ══════════════════════════════════════════════
 {qa_block}
 
 ══════════════════════════════════════════════
-FAILURE TRIGGER LOGIC (apply this EXACTLY):
+FAILURE TRIGGER LOGIC (apply this EXACTLY as written):
 ══════════════════════════════════════════════
 {state['failure_trigger_text']}
 ══════════════════════════════════════════════
 
 INSTRUCTIONS:
-- Evaluate each condition in the failure trigger against the evidence gathered
-- If ANY failure condition is met → "Non-Compliant"
-- If a FLAG FOR CHECKING condition is met → "Partial" (needs manual review)
-- If NO failure conditions are met → "Compliant"
-- If evidence is insufficient to determine → "Partial"
-- For Auditor Oversight: did the statutory auditor catch or miss this issue?
+1. Review the workflow steps and their findings holistically
+2. Apply EACH condition in the failure trigger against the evidence gathered:
+   - If ANY failure condition is met → "Non-Compliant"
+   - If a FLAG FOR CHECKING condition is met → "Partial" (needs manual review)
+   - If NO failure conditions are met AND evidence confirms compliance → "Compliant"
+   - If evidence is insufficient to determine → "Partial"
+3. For Auditor Oversight: did the statutory auditor identify this issue in their report?
+   If the auditor missed a material non-compliance that the workflow detected, say "Yes".
+4. CONFIDENCE: Be honest. If the evidence trail is strong and consistent → high confidence.
+   If findings are mixed or evidence was missing for key steps → lower confidence.
+   DO NOT default to 85.
 
 Respond ONLY with valid JSON:
 {{
     "compliance_status": "Compliant / Non-Compliant / Partial",
     "failure_trigger_met": true or false,
-    "summary_finding": "2-3 sentence finding for this rule",
+    "summary_finding": "2-3 sentence finding synthesizing the workflow results",
     "auditor_oversight": "Yes — [what was missed] / No — auditor addressed this adequately",
-    "confidence": 85
+    "confidence": <integer 0-100, calibrated honestly>
 }}"""
 
     result = llm_json(prompt, {
@@ -585,14 +828,21 @@ Respond ONLY with valid JSON:
 def node_build_output(state: AuditState) -> AuditState:
     """Assemble all fields for the Compliance Matrix row."""
 
-    # Reasoning path: full step-by-step trail
+    # Reasoning path: executed steps in order, with skipped steps noted
     rp = []
-    for i, r in enumerate(state["question_responses"]):
-        rp.append(
-            f"Step {i+1}: {r['question']}\n"
-            f"  Answer: {r['answer']}\n"
-            f"  Reasoning: {r.get('reasoning', 'N/A')}"
-        )
+    executed_ids = [r["step_id"] for r in state["question_responses"]]
+    skipped = state.get("skipped_steps", [])
+
+    for sid in state["step_order"]:
+        if sid in skipped:
+            rp.append(f"Step [{sid}]: SKIPPED (conditional branch not taken)")
+        elif sid in executed_ids:
+            r = next(r for r in state["question_responses"] if r["step_id"] == sid)
+            rp.append(
+                f"Step [{sid}]: {r['question']}\n"
+                f"  Answer: {r['answer']}\n"
+                f"  Reasoning: {r.get('reasoning', 'N/A')}"
+            )
     state["reasoning_path"] = "\n\n".join(rp)
 
     # Evidence: combined from all questions
@@ -618,20 +868,26 @@ def node_build_output(state: AuditState) -> AuditState:
 # 8. GRAPH CONSTRUCTION
 # ═══════════════════════════════════════════════════════════════════
 
-def route_after_increment(state: AuditState) -> str:
-    if state["current_question_index"] >= len(state["parsed_questions"]):
+def route_after_router(state: AuditState) -> str:
+    """After the router decides the next step, check if we're done or should continue."""
+    if state["current_step_id"] == "DONE":
+        return "evaluate_triggers"
+    # Safety: prevent infinite loops
+    max_steps = len(state["step_order"]) + 2  # allow slight overhead but not infinite
+    if state["steps_executed"] >= max_steps:
+        print(f"      ⚠ Safety limit reached ({state['steps_executed']} steps), forcing evaluation")
         return "evaluate_triggers"
     return "process_question"
 
 
 def build_graph():
     """
-    Compile the LangGraph workflow:
+    Compile the LangGraph workflow with LLM-powered routing:
 
-      init ──► process_question ──► validate ──► increment ──┐
-                    ▲                                         │
-                    └──── (more questions?) ◄──────────────────┘
-                                │ (all done)
+      init ──► process_question ──► validate ──► route_next_step ──┐
+                    ▲                                               │
+                    └──── (next step?) ◄────────────────────────────┘
+                                │ (DONE)
                                 ▼
                      evaluate_triggers ──► build_output ──► END
     """
@@ -640,15 +896,15 @@ def build_graph():
     g.add_node("init", node_init)
     g.add_node("process_question", node_process_question)
     g.add_node("validate", node_validate)
-    g.add_node("increment", node_increment)
+    g.add_node("route_next_step", node_route_next_step)
     g.add_node("evaluate_triggers", node_evaluate_triggers)
     g.add_node("build_output", node_build_output)
 
     g.set_entry_point("init")
     g.add_edge("init", "process_question")
     g.add_edge("process_question", "validate")
-    g.add_edge("validate", "increment")
-    g.add_conditional_edges("increment", route_after_increment, {
+    g.add_edge("validate", "route_next_step")
+    g.add_conditional_edges("route_next_step", route_after_router, {
         "process_question": "process_question",
         "evaluate_triggers": "evaluate_triggers",
     })
@@ -747,7 +1003,7 @@ def run(reports_dir: str, rules_path: str, output_path: str, rules_sheet: str = 
     rules = parse_rules(rules_path, rules_sheet)
     print(f"\nLoaded {len(rules)} rule(s) from '{rules_path}'")
     for r in rules:
-        print(f"  • {r['rule_id']}: {r['rule_details'][:60]}... ({len(r['parsed_questions'])} questions)")
+        print(f"  • {r['rule_id']}: {r['rule_details'][:60]}... ({len(r['step_order'])} steps)")
 
     workflow = build_graph()
     all_rows = []
@@ -760,11 +1016,12 @@ def run(reports_dir: str, rules_path: str, output_path: str, rules_sheet: str = 
         print(f"{'━' * 70}")
 
         for rule in rules:
-            if not rule["parsed_questions"]:
-                print(f"  ⏭ {rule['rule_id']}: no questions parsed, skipping")
+            if not rule["step_order"]:
+                print(f"  ⏭ {rule['rule_id']}: no workflow steps parsed, skipping")
                 continue
 
             print(f"\n  ── Rule {rule['rule_id']}: {rule['rule_details'][:50]}... ──")
+            print(f"     Steps: {rule['step_order']}")
 
             initial: AuditState = {
                 "company_name": company["name"],
@@ -772,12 +1029,16 @@ def run(reports_dir: str, rules_path: str, output_path: str, rules_sheet: str = 
                 "rule_details": rule["rule_details"],
                 "standard_ref": rule["standard_ref"],
                 "audit_requirement": rule["audit_requirement"],
-                "parsed_questions": rule["parsed_questions"],
-                "current_question_index": 0,
+                "workflow_steps": rule["workflow_steps"],
+                "step_order": rule["step_order"],
+                "current_step_id": rule["step_order"][0],
+                "steps_executed": 0,
+                "skipped_steps": [],
                 "available_sections": sections,
                 "section_filenames": {k: f"{k}.md" for k in sections},
                 "question_responses": [],
                 "failure_trigger_text": rule["failure_trigger_text"],
+                "raw_workflow": rule.get("raw_workflow", ""),
                 "failure_trigger_met": False,
                 "compliance_status": None,
                 "summary_finding": None,
